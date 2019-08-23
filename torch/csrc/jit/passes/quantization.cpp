@@ -732,12 +732,12 @@ std::tuple<std::string, c10::optional<script::Module>> findObserverModule(
     auto submodule_name = u.user->inputs().at(0)->debugName();
     if (u.user->kind() == prim::CallMethod && u.user->s(attr::name) == "forward" &&
 //            u.user->inputs().at(0)->type()->kind() == c10::ClassType &&
-            submodule_name.find("observer_for_") == 0) {
-          auto observer_module = module.find_module(submodule_name);
-          return std::make_tuple(submodule_name, observer_module);
-        }
-      }
-      return std::make_tuple("", c10::nullopt);
+        submodule_name.find("observer_for_") == 0) {
+      auto observer_module = module.find_module(submodule_name);
+      return std::make_tuple(submodule_name, observer_module);
+    }
+  }
+  return std::make_tuple("", c10::nullopt);
 }
 
 IValue getQParam(const script::Module& module, Value* v) {
@@ -829,10 +829,9 @@ void quantizeTensor(const script::Module& module,
 }
 
 script::Module InsertQuantDeQuant(
-    const script::Module& module,
+    const script::Module& input_module,
     const std::string& method_name) {
-  // TODO: Uncomment
-  //script::Module module = input_module.clone();
+  script::Module module = input_module.clone();
   script::Method method = module.get_method(method_name);
   auto graph = method.graph();
   TORCH_CHECK(graph != nullptr);
@@ -922,6 +921,48 @@ script::Module InsertQuantDeQuant(
   // TODO: remove observer modules after we have a remove_module API
 
   return module;
+}
+
+void QuantFusion(std::shared_ptr<Graph>& graph) {
+  SubgraphRewriter rewriter;
+  std::string pattern = R"(
+graph(%a, %w, %b, %a_scale, %a_zero_point, %a_dtype, %w_scale, %w_zero_point, %w_dtype, %b_scale, %b_zero_point, %b_dtype, %r_scale, %r_zero_point, %r_dtype, %c, %d, %e, %f):
+        %a_quant = aten::quantize_linear(%a, %a_scale, %a_zero_point, %a_dtype)
+        %a_intrepr = aten::int_repr(%a_quant)
+        %a_dequant = aten::_dequantize_linear(%a_intrepr, %a_scale, %a_zero_point, %a_dtype)
+        %w_quant = aten::quantize_linear(%w, %w_scale, %w_zero_point, %w_dtype)
+        %w_intrepr = aten::int_repr(%w_quant)
+        %w_dequant = aten::_dequantize_linear(%w_intrepr, %w_scale, %w_zero_point, %w_dtype)
+        %b_quant = aten::quantize_linear(%b, %b_scale, %b_zero_point, %b_dtype)
+        %b_intrepr = aten::int_repr(%b_quant)
+        %b_dequant = aten::_dequantize_linear(%b_intrepr, %b_scale, %b_zero_point, %b_dtype)
+        %r = aten::conv2d(%a_dequant, %w_dequant, %b_dequant, %c, %d, %e, %f)
+        %r_quant = aten::quantize_linear(%r, %r_scale, %r_zero_point, %r_dtype)
+        %r_intrepr = aten::int_repr(%r_quant)
+        %r_dequant = aten::_dequantize_linear(%r_intrepr, %r_scale, %r_zero_point, %r_dtype)
+        return (%r_dequant))";
+
+  std::string replacement = R"(
+graph(%a, %w, %b, %a_scale, %a_zero_point, %a_dtype, %w_scale, %w_zero_point, %w_dtype, %b_scale, %b_zero_point, %b_dtype, %r_scale, %r_zero_point, %r_dtype, %stride, %padding, %dilation, %groups):
+        %a_quant = aten::quantize_linear(%a, %a_scale, %a_zero_point, %a_dtype)
+        %w_quant = aten::quantize_linear(%w, %w_scale, %w_zero_point, %w_dtype)
+        %b_quant = aten::quantize_linear(%b, %b_scale, %b_zero_point, %b_dtype)
+        %0 : int = prim::Constant[value=0]()
+        %1 : int = prim::Constant[value=1]()
+        %2 : int = prim::Constant[value=2]()
+        %3 : int = prim::Constant[value=3]()
+        %in_param : int[] = prim::ListConstruct(%0, %2, %3, %1)
+        %a_perm : Tensor = aten::permute(%a_quant, %in_param)
+        %w_perm : Tensor = aten::permute(%w_quant, %in_param)
+        %w_packed = quantized::fbgemm_conv_prepack(%w_perm, %stride, %padding, %dilation, %groups)
+        %r = quantized::fbgemm_conv2d(%a_perm, %w_packed, %b_quant, %stride, %padding, %dilation, %groups, %r_scale, %r_zero_point)
+        %out_param : int[] = prim::ListConstruct(%0, %3, %1, %2)
+        %r_perm = aten::permute(%r, %out_param)
+        %r_intrepr = aten::int_repr(%r_perm)
+        %r_dequant = aten::_dequantize_linear(%r_intrepr, %r_scale, %r_zero_point, %r_dtype)
+        return (%r_dequant))";
+  rewriter.RegisterRewritePattern(pattern, replacement);
+  rewriter.runOnGraph(graph);
 }
 
 } // namespace jit
